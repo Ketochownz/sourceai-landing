@@ -116,7 +116,7 @@ async function fetchSite(targetUrl) {
       const resp = await fetchWithTimeout(attempt, 8000);
       if (resp.ok) {
         const text = await resp.text();
-        return { ok: true, html: text.slice(0, 500000) }; // cap at 500kb, plenty for a homepage
+        return { ok: true, html: text.slice(0, 3000000) }; // cap at 3MB — 500KB was truncating content-heavy pages before reaching scripts near </body>
       }
     } catch (e) {
       // try the next attempt
