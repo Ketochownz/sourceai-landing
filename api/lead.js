@@ -60,6 +60,8 @@ export default async function handler(request) {
     name,
     email,
     domain: typeof body.domain === "string" ? body.domain.slice(0, 200) : "",
+    recommended_plan: typeof body.recommended_plan === "string" ? body.recommended_plan.slice(0, 100) : "",
+    issue_count: typeof body.issue_count === "number" ? body.issue_count : null,
     chat_status: pickStatus(body.chat_status),
     leadcapture_status: pickStatus(body.leadcapture_status),
     aivisibility_status: pickStatus(body.aivisibility_status),

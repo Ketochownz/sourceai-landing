@@ -420,6 +420,8 @@
 
   let lastDomain = '';
   let scanResults = [];
+  let lastRecommendedPlan = 'none';
+  let lastIssueCount = 0;
   let quizAnswers = {};
 
   // ---------- automated check metadata ----------
@@ -729,6 +731,7 @@
 
     const totalPoints = allResults.reduce((sum, r) => sum + scoreFor(r.status), 0);
     const maxPoints = allResults.length * 10;
+    lastIssueCount = allResults.filter(r => r.status !== 'green').length;
     renderScoreHeader(totalPoints, maxPoints, `${lastDomain} — full picture, 10 checks`);
 
     // append quiz rows to the results list, styled the same as automated rows
@@ -752,6 +755,7 @@
     });
 
     if (recTier) {
+      lastRecommendedPlan = recTier;
       const info = TIER_INFO[recTier];
       const reasonMap = {
         'Foundation': "Fixes what's missing here — a smart, AI-visible, fast website with a chat agent, CRM and missed-call cover built in.",
@@ -767,6 +771,8 @@
           <a href="${info.href}" class="btn btn-primary">See ${recTier} →</a>
         </div>
       `);
+    } else {
+      lastRecommendedPlan = 'none';
     }
 
     afterQuiz.style.display = '';
@@ -790,6 +796,8 @@
       name,
       email,
       domain: lastDomain,
+      recommended_plan: lastRecommendedPlan,
+      issue_count: lastIssueCount,
       chat_status: (scanResults.find(r => r.key === 'chat') || {}).status || '',
       leadcapture_status: (scanResults.find(r => r.key === 'leadcapture') || {}).status || '',
       aivisibility_status: (scanResults.find(r => r.key === 'aivisibility') || {}).status || '',
