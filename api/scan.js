@@ -1,21 +1,24 @@
 /**
  * Source Ai — AI Readiness Snapshot backend (plain Vercel Edge Function)
  *
- * This project has no framework (no Next.js, no build step), so this uses
- * Vercel's zero-config convention: any file in a top-level /api folder
- * automatically becomes a serverless function. Place this at exactly:
+ * Zero-config Vercel convention — place at exactly: api/scan.js
+ * Live at: https://sourceai.co.nz/api/scan
  *
- *   api/scan.js
+ * Fetches a target website server-side and runs 7 checks:
+ *   1. chat          — recognised smart/AI chat widget present
+ *   2. leadcapture    — working lead-capture mechanism (form, booking, click-to-call)
+ *   3. aivisibility   — robots.txt blocking AI crawlers + structured data present
+ *   4. speed          — approximate load speed (response time + page weight)
+ *   5. seo            — basic on-page SEO (title, meta description, H1, alt text)
+ *   6. reviews        — visible review/reputation widget
+ *   7. social         — links to social platforms
  *
- * Live at: https://sourceai.co.nz/api/scan (once deployed)
- *
- * Fetches a target website server-side (no CORS issue — this runs on
- * Vercel's edge, not in a browser) and checks for three things:
- *   1. A recognised smart/AI chat widget (including Source Ai's own Lucid
- *      Chat Agent widget)
- *   2. A working lead-capture mechanism (form, booking widget, click-to-call)
- *   3. Whether AI assistants (ChatGPT, Perplexity, Google AI, Claude) can
- *      actually see the site — robots.txt blocking + basic structured data
+ * Uses a realistic browser User-Agent, since some sites (Shopify
+ * speed-optimizer apps, WAF/bot-protection) serve different content to
+ * requests identified as bots or coming from datacenter IPs. Note: this
+ * doesn't fully solve IP-reputation-based filtering — a small number of
+ * heavily-protected sites may still return red/false-negative results.
+ * That's a known, accepted limitation, not a bug to keep chasing.
  *
  * No third-party API keys required. Nothing is stored — each request is
  * scanned fresh.
@@ -58,15 +61,21 @@ export default async function handler(request) {
 
   const robotsTxt = await fetchRobotsTxt(targetUrl);
 
-  const chat = checkChat(fetched.html);
-  const leadcapture = checkLeadCapture(fetched.html);
-  const aivisibility = checkAiVisibility(fetched.html, robotsTxt);
+  const checks = {
+    chat: checkChat(fetched.html),
+    leadcapture: checkLeadCapture(fetched.html),
+    aivisibility: checkAiVisibility(fetched.html, robotsTxt),
+    speed: checkSpeed(fetched.fetchTimeMs, fetched.byteLength),
+    seo: checkSeo(fetched.html),
+    reviews: checkReviews(fetched.html),
+    social: checkSocial(fetched.html),
+  };
 
   return json(
     {
       domain: target,
       reachable: true,
-      checks: { chat, leadcapture, aivisibility },
+      checks,
     },
     200
   );
@@ -113,10 +122,13 @@ async function fetchSite(targetUrl) {
 
   for (const attempt of attempts) {
     try {
-      const resp = await fetchWithTimeout(attempt, 8000);
+      const start = Date.now();
+      const resp = await fetchWithTimeout(attempt, 10000);
       if (resp.ok) {
         const text = await resp.text();
-        return { ok: true, html: text.slice(0, 3000000) }; // cap at 3MB — 500KB was truncating content-heavy pages before reaching scripts near </body>
+        const fetchTimeMs = Date.now() - start;
+        const html = text.slice(0, 3000000); // cap at 3MB
+        return { ok: true, html, fetchTimeMs, byteLength: text.length };
       }
     } catch (e) {
       // try the next attempt
@@ -139,7 +151,7 @@ async function fetchRobotsTxt(targetUrl) {
   return "";
 }
 
-// ---------- detection: chat ----------
+// ---------- check: chat ----------
 
 const CHAT_SIGNATURES = [
   { name: "Lucid Chat Agent", pattern: /app\.lucidos\.nz|smartbot\.thesource\.nz|LucidReboot/i },
@@ -162,16 +174,12 @@ const MESSENGER_PLUGIN = /fb-customerchat|customer_chat/i;
 
 function checkChat(html) {
   const matched = CHAT_SIGNATURES.filter((s) => s.pattern.test(html)).map((s) => s.name);
-  if (matched.length > 0) {
-    return { status: "green", detected: matched };
-  }
-  if (MESSENGER_PLUGIN.test(html)) {
-    return { status: "amber", detected: ["Facebook Messenger plugin"] };
-  }
+  if (matched.length > 0) return { status: "green", detected: matched };
+  if (MESSENGER_PLUGIN.test(html)) return { status: "amber", detected: ["Facebook Messenger plugin"] };
   return { status: "red", detected: [] };
 }
 
-// ---------- detection: lead capture ----------
+// ---------- check: lead capture ----------
 
 const LEAD_PLATFORM_SIGNATURES = [
   { name: "Calendly", pattern: /calendly\.com/i },
@@ -191,11 +199,6 @@ const LEAD_PLATFORM_SIGNATURES = [
 
 const CONTACT_WORDS = /contact|enquir|inquir|get in touch|request a quote|message us|send (a |us a )?message|book a (call|consult)/i;
 
-// A bare <form> tag is a weak, noisy signal on its own — ecommerce sites are
-// full of forms that have nothing to do with lead capture (search, newsletter
-// popups, cart, login). This only counts a form as a real "contact form" if
-// contact-flavoured wording appears near it, rather than crediting any form
-// on the page.
 function hasContactForm(html) {
   const parts = html.split(/<form/i);
   if (parts.length <= 1) return false;
@@ -209,10 +212,8 @@ function hasContactForm(html) {
 
 function checkLeadCapture(html) {
   const found = [];
-
   const platformMatch = LEAD_PLATFORM_SIGNATURES.find((s) => s.pattern.test(html));
   if (platformMatch) found.push(platformMatch.name);
-
   if (hasContactForm(html)) found.push("contact form");
   if (/href=["']tel:/i.test(html)) found.push("click-to-call");
   if (/href=["']mailto:/i.test(html)) found.push("email link");
@@ -223,35 +224,17 @@ function checkLeadCapture(html) {
   return { status: "red", detected: found };
 }
 
-// ---------- detection: AI visibility ----------
+// ---------- check: AI visibility ----------
 
-// Known AI crawler / retrieval bot user-agents worth checking robots.txt for.
-// Not exhaustive, and this is a lightweight heuristic parser (not a full
-// RFC 9309 implementation) — it's built to catch the common
-// "User-agent: X / Disallow: /" blocking pattern, which is what actually
-// matters for a sales-tool-grade check like this.
 const AI_BOTS = [
-  "gptbot",
-  "chatgpt-user",
-  "oai-searchbot",
-  "perplexitybot",
-  "google-extended",
-  "claudebot",
-  "claude-web",
-  "anthropic-ai",
-  "ccbot",
-  "cohere-ai",
-  "bytespider",
-  "applebot-extended",
+  "gptbot", "chatgpt-user", "oai-searchbot", "perplexitybot", "google-extended",
+  "claudebot", "claude-web", "anthropic-ai", "ccbot", "cohere-ai", "bytespider", "applebot-extended",
 ];
 
 function parseRobotsBlocking(robotsTxt) {
   if (!robotsTxt) return { blocked: false, blockedBots: [] };
 
-  const lines = robotsTxt
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#"));
+  const lines = robotsTxt.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
 
   let groupAgents = [];
   let sawRuleInGroup = false;
@@ -268,7 +251,6 @@ function parseRobotsBlocking(robotsTxt) {
       groupAgents.push(uaMatch[1].trim().toLowerCase());
       continue;
     }
-
     const disallowMatch = line.match(/^disallow:\s*(.*)$/i);
     if (disallowMatch) {
       sawRuleInGroup = true;
@@ -281,10 +263,7 @@ function parseRobotsBlocking(robotsTxt) {
       }
       continue;
     }
-
-    if (/^(allow|crawl-delay|sitemap):/i.test(line)) {
-      sawRuleInGroup = true;
-    }
+    if (/^(allow|crawl-delay|sitemap):/i.test(line)) sawRuleInGroup = true;
   }
 
   return { blocked: globalBlockAll || blockedBots.size > 0, blockedBots: Array.from(blockedBots) };
@@ -296,17 +275,82 @@ function hasStructuredData(html) {
 
 function checkAiVisibility(html, robotsTxt) {
   const robots = parseRobotsBlocking(robotsTxt);
-
   if (robots.blocked) {
-    return {
-      status: "red",
-      detected: robots.blockedBots.length ? robots.blockedBots : ["robots.txt blocks all crawlers"],
-    };
+    return { status: "red", detected: robots.blockedBots.length ? robots.blockedBots : ["robots.txt blocks all crawlers"] };
   }
-
-  if (!hasStructuredData(html)) {
-    return { status: "amber", detected: [] };
-  }
-
+  if (!hasStructuredData(html)) return { status: "amber", detected: [] };
   return { status: "green", detected: ["schema.org structured data"] };
+}
+
+// ---------- check: speed (fast approximation, not real Lighthouse) ----------
+
+function checkSpeed(fetchTimeMs, byteLength) {
+  const seconds = (fetchTimeMs / 1000).toFixed(1);
+  const kb = Math.round(byteLength / 1024);
+  const detail = [`${seconds}s response, ${kb}KB`];
+
+  if (fetchTimeMs < 1500 && byteLength < 2000000) return { status: "green", detected: detail };
+  if (fetchTimeMs < 3000 && byteLength < 5000000) return { status: "amber", detected: detail };
+  return { status: "red", detected: detail };
+}
+
+// ---------- check: on-page SEO ----------
+
+function checkSeo(html) {
+  const found = [];
+
+  const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+  const titleText = titleMatch ? titleMatch[1].trim() : "";
+  if (titleText.length >= 10 && titleText.length <= 70) found.push("title tag");
+
+  if (/<meta\s+name=["']description["']\s+content=["'][^"']{20,}/i.test(html)) found.push("meta description");
+
+  if (/<h1[\s>]/i.test(html)) found.push("H1 heading");
+
+  const imgTags = html.match(/<img[^>]*>/gi) || [];
+  if (imgTags.length > 0) {
+    const withAlt = imgTags.filter((tag) => /alt=["'][^"']+["']/i.test(tag));
+    if (withAlt.length / imgTags.length >= 0.5) found.push("image alt text");
+  }
+
+  const score = found.length;
+  if (score >= 3) return { status: "green", detected: found };
+  if (score >= 1) return { status: "amber", detected: found };
+  return { status: "red", detected: found };
+}
+
+// ---------- check: reviews & reputation ----------
+
+const REVIEW_SIGNATURES = [
+  { name: "Trustpilot", pattern: /trustpilot\.com|widget\.trustpilot\.com/i },
+  { name: "Yotpo", pattern: /yotpo\.com|staticw2\.yotpo\.com/i },
+  { name: "Judge.me", pattern: /judge\.me/i },
+  { name: "Stamped.io", pattern: /stamped\.io/i },
+  { name: "Google Reviews widget", pattern: /reviews\.googleapis\.com|google-reviews-widget|elfsight.*review/i },
+];
+
+function checkReviews(html) {
+  const matched = REVIEW_SIGNATURES.filter((s) => s.pattern.test(html)).map((s) => s.name);
+  if (matched.length > 0) return { status: "green", detected: matched };
+  if (/aggregateRating|reviewCount/i.test(html)) return { status: "amber", detected: ["review schema markup"] };
+  return { status: "red", detected: [] };
+}
+
+// ---------- check: social presence ----------
+
+const SOCIAL_SIGNATURES = [
+  { name: "Facebook", pattern: /(?:www\.)?facebook\.com\/(?!sharer|share\.php|tr\?)[a-zA-Z0-9._-]+/i },
+  { name: "Instagram", pattern: /(?:www\.)?instagram\.com\/(?!p\/|reel\/)[a-zA-Z0-9._-]+/i },
+  { name: "LinkedIn", pattern: /linkedin\.com\/company\/[a-zA-Z0-9._-]+/i },
+  { name: "TikTok", pattern: /tiktok\.com\/@[a-zA-Z0-9._-]+/i },
+];
+
+function checkSocial(html) {
+  const matched = [];
+  for (const s of SOCIAL_SIGNATURES) {
+    if (s.pattern.test(html)) matched.push(s.name);
+  }
+  if (matched.length >= 2) return { status: "green", detected: matched };
+  if (matched.length === 1) return { status: "amber", detected: matched };
+  return { status: "red", detected: [] };
 }
